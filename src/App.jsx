@@ -14,14 +14,56 @@ function App() {
 
   const [feedbackMsgs, setFeedbackMsgs] = useState([]);
   const lastHandPositions = useRef([]);
+  const feedbackTimers = useRef({});
 
   useEffect(() => {
-    let faceMesh;
-    let pose;
-    let hands;
+    let faceMesh, pose, hands;
+    let blinkCount = 0;
+    let lastBlinkTime = performance.now();
+    let blinkHistory = [];
+
+    let yawnCount = 0;
+    let isYawning = false;
+
+    function getEAR(upper, lower) {
+      return Math.abs(upper.y - lower.y);
+    }
+
+    function distance(a, b) {
+      return Math.sqrt(Math.pow(a.x - b.x, 2) + Math.pow(a.y - b.y, 2));
+    }
+
+    function detectBlinkAndYawn(landmarks) {
+      if (!landmarks) return;
+
+      const leftEAR = getEAR(landmarks[159], landmarks[145]);
+      const rightEAR = getEAR(landmarks[386], landmarks[374]);
+      const avgEAR = (leftEAR + rightEAR) / 2;
+
+      const blinkThreshold = 0.23;
+      const now = performance.now();
+
+      if (avgEAR < blinkThreshold) {
+        if (now - lastBlinkTime > 300) {
+          blinkCount++;
+          lastBlinkTime = now;
+          blinkHistory.push(now);
+        }
+      }
+
+      blinkHistory = blinkHistory.filter((t) => now - t < 60000);
+
+      const mouthOpen = distance(landmarks[13], landmarks[14]);
+      const yawnThreshold = 0.05;
+      if (mouthOpen > yawnThreshold && !isYawning) {
+        yawnCount++;
+        isYawning = true;
+      } else if (mouthOpen <= yawnThreshold) {
+        isYawning = false;
+      }
+    }
 
     async function init() {
-      // Initialize FaceMesh
       faceMesh = new FaceMesh({
         locateFile: (file) =>
           `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`,
@@ -36,7 +78,6 @@ function App() {
         latestFaceLandmarks.current = results.multiFaceLandmarks;
       });
 
-      // Initialize Pose
       pose = new Pose({
         locateFile: (file) =>
           `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
@@ -52,7 +93,6 @@ function App() {
         latestPoseLandmarks.current = results.poseLandmarks;
       });
 
-      // Initialize Hands
       hands = new Hands({
         locateFile: (file) =>
           `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
@@ -67,7 +107,6 @@ function App() {
         latestHandsLandmarks.current = results.multiHandLandmarks;
       });
 
-      // Start webcam
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480 },
         audio: false,
@@ -87,6 +126,24 @@ function App() {
       }
     }
 
+    function updateMessages(newMsgs) {
+      const now = Date.now();
+      const updated = { ...feedbackTimers.current };
+
+      for (const msg of newMsgs) {
+        updated[msg] = now + 3000;
+      }
+
+      for (const msg in updated) {
+        if (updated[msg] < now) {
+          delete updated[msg];
+        }
+      }
+
+      feedbackTimers.current = updated;
+      setFeedbackMsgs(Object.keys(updated));
+    }
+
     async function drawLoop() {
       await processFrame();
 
@@ -96,93 +153,118 @@ function App() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
 
-      // Draw face landmarks
-      if (latestFaceLandmarks.current) {
-        for (const landmarks of latestFaceLandmarks.current) {
-          for (const landmark of landmarks) {
-            ctx.beginPath();
-            ctx.arc(
-              landmark.x * canvas.width,
-              landmark.y * canvas.height,
-              2,
-              0,
-              2 * Math.PI
-            );
-            ctx.fillStyle = "lime";
-            ctx.fill();
-          }
+      if (latestFaceLandmarks.current?.[0]) {
+        for (const landmark of latestFaceLandmarks.current[0]) {
+          ctx.beginPath();
+          ctx.arc(
+            landmark.x * canvas.width,
+            landmark.y * canvas.height,
+            2,
+            0,
+            2 * Math.PI
+          );
+          ctx.fillStyle = "lime";
+          ctx.fill();
         }
+
+        detectBlinkAndYawn(latestFaceLandmarks.current[0]);
       }
 
-      // Draw pose landmarks
       if (latestPoseLandmarks.current) {
         drawPose(ctx, latestPoseLandmarks.current, canvas.width, canvas.height);
       }
 
-      // Draw hand landmarks
       if (latestHandsLandmarks.current) {
         for (const hand of latestHandsLandmarks.current) {
           drawHand(ctx, hand, canvas.width, canvas.height);
         }
       }
 
-      // Collect feedback for this frame
       const currentFeedbacks = [];
 
-      // Face centering
       if (latestFaceLandmarks.current?.[0]) {
         const noseTip = latestFaceLandmarks.current[0][1];
-        const xCenter = noseTip.x;
-        if (xCenter < 0.35) {
-          currentFeedbacks.push("Please move slightly to your right.");
-        } else if (xCenter > 0.65) {
-          currentFeedbacks.push("Please move slightly to your left.");
+        if (noseTip.x < 0.35)
+          currentFeedbacks.push("Move slightly to your right.");
+        else if (noseTip.x > 0.65)
+          currentFeedbacks.push("Move slightly to your left.");
+
+        const leftEyeInner = latestFaceLandmarks.current[0][133];
+        const leftEyeOuter = latestFaceLandmarks.current[0][33];
+        const leftIris = latestFaceLandmarks.current[0][468];
+        const rightEyeInner = latestFaceLandmarks.current[0][362];
+        const rightEyeOuter = latestFaceLandmarks.current[0][263];
+        const rightIris = latestFaceLandmarks.current[0][473];
+
+        if (
+          leftEyeInner &&
+          leftEyeOuter &&
+          leftIris &&
+          rightEyeInner &&
+          rightEyeOuter &&
+          rightIris
+        ) {
+          const leftEyeWidth = leftEyeOuter.x - leftEyeInner.x;
+          const leftIrisPos = (leftIris.x - leftEyeInner.x) / leftEyeWidth;
+
+          const rightEyeWidth = rightEyeOuter.x - rightEyeInner.x;
+          const rightIrisPos = (rightIris.x - rightEyeInner.x) / rightEyeWidth;
+
+          const avgIrisPos = (leftIrisPos + rightIrisPos) / 2;
+
+          if (avgIrisPos < 0.35)
+            currentFeedbacks.push("Looking left or off-screen");
+          else if (avgIrisPos > 0.65)
+            currentFeedbacks.push("Looking right or off-screen");
         }
       }
 
-      // Pose tilt
       if (latestPoseLandmarks.current) {
-        const leftShoulder = latestPoseLandmarks.current[11];
-        const rightShoulder = latestPoseLandmarks.current[12];
-        if (leftShoulder && rightShoulder) {
-          const dy = Math.abs(leftShoulder.y - rightShoulder.y);
-          if (dy > 0.1) {
-            currentFeedbacks.push("Try to sit straight — you're leaning.");
-          }
-        }
+        const left = latestPoseLandmarks.current[11];
+        const right = latestPoseLandmarks.current[12];
+        if (left && right && Math.abs(left.y - right.y) > 0.1)
+          currentFeedbacks.push("Sit straight, you're leaning.");
       }
 
-      // Hand movement
       if (latestHandsLandmarks.current?.length) {
         const current = latestHandsLandmarks.current.map((hand) =>
           hand.map((lm) => ({ x: lm.x, y: lm.y }))
         );
-        if (lastHandPositions.current.length) {
-          const prev = lastHandPositions.current;
-          let totalMovement = 0;
 
+        if (lastHandPositions.current.length) {
+          let movement = 0;
           for (let i = 0; i < current.length; i++) {
             for (let j = 0; j < current[i].length; j++) {
-              const dx = current[i][j].x - prev[i]?.[j]?.x || 0;
-              const dy = current[i][j].y - prev[i]?.[j]?.y || 0;
-              totalMovement += dx * dx + dy * dy;
+              const dx =
+                current[i][j].x - (lastHandPositions.current[i]?.[j]?.x || 0);
+              const dy =
+                current[i][j].y - (lastHandPositions.current[i]?.[j]?.y || 0);
+              movement += dx * dx + dy * dy;
             }
           }
-
-          if (totalMovement > 0.02) {
-            currentFeedbacks.push("Avoid moving your hands too much.");
-          }
+          if (movement > 0.02)
+            currentFeedbacks.push("Avoid moving hands too much.");
         }
+
         lastHandPositions.current = current;
       }
 
-      setFeedbackMsgs(currentFeedbacks);
+      if (blinkHistory.length > 20) {
+        currentFeedbacks.push(
+          "High blink rate detected – possible nervousness"
+        );
+      }
+      if (yawnCount > 2) {
+        currentFeedbacks.push(
+          "Yawning detected – possible drowsiness or low energy"
+        );
+      }
 
+      updateMessages(currentFeedbacks);
       animationRef.current = requestAnimationFrame(drawLoop);
     }
 
     init();
-
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
       if (videoRef.current?.srcObject) {
@@ -195,13 +277,11 @@ function App() {
     ctx.lineWidth = 2;
     ctx.strokeStyle = "red";
     ctx.fillStyle = "red";
-
     for (const landmark of landmarks) {
       ctx.beginPath();
       ctx.arc(landmark.x * width, landmark.y * height, 4, 0, 2 * Math.PI);
       ctx.fill();
     }
-
     const connections = [
       [11, 13],
       [13, 15],
@@ -216,10 +296,9 @@ function App() {
       [24, 26],
       [26, 28],
     ];
-
     for (const [i, j] of connections) {
-      const start = landmarks[i];
-      const end = landmarks[j];
+      const start = landmarks[i],
+        end = landmarks[j];
       if (start && end) {
         ctx.beginPath();
         ctx.moveTo(start.x * width, start.y * height);
@@ -233,13 +312,11 @@ function App() {
     ctx.strokeStyle = "yellow";
     ctx.lineWidth = 2;
     ctx.fillStyle = "yellow";
-
-    for (const landmark of landmarks) {
+    for (const lm of landmarks) {
       ctx.beginPath();
-      ctx.arc(landmark.x * width, landmark.y * height, 3, 0, 2 * Math.PI);
+      ctx.arc(lm.x * width, lm.y * height, 3, 0, 2 * Math.PI);
       ctx.fill();
     }
-
     const connections = [
       [0, 1],
       [1, 2],
@@ -263,14 +340,13 @@ function App() {
       [19, 20],
       [0, 17],
     ];
-
     for (const [i, j] of connections) {
-      const start = landmarks[i];
-      const end = landmarks[j];
-      if (start && end) {
+      const a = landmarks[i],
+        b = landmarks[j];
+      if (a && b) {
         ctx.beginPath();
-        ctx.moveTo(start.x * width, start.y * height);
-        ctx.lineTo(end.x * width, end.y * height);
+        ctx.moveTo(a.x * width, a.y * height);
+        ctx.lineTo(b.x * width, b.y * height);
         ctx.stroke();
       }
     }
@@ -289,13 +365,7 @@ function App() {
       }}
     >
       <h1 style={{ color: "#fff" }}>AI Interview Demo</h1>
-      <div
-        style={{
-          position: "relative",
-          width: "640px",
-          height: "480px",
-        }}
-      >
+      <div style={{ position: "relative", width: "640px", height: "480px" }}>
         <video
           ref={videoRef}
           width="640"
@@ -323,8 +393,7 @@ function App() {
             pointerEvents: "none",
             border: "2px solid white",
           }}
-        ></canvas>
-
+        />
         {feedbackMsgs.length > 0 && (
           <div
             style={{
